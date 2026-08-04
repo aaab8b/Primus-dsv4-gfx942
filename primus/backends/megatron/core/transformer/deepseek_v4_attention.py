@@ -110,6 +110,18 @@ _SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 logger = logging.getLogger(__name__)
 
 
+def _v4_get_cp_group():
+    from primus.backends.megatron.core.transformer.deepseek_v4_cp import get_cp_group
+
+    return get_cp_group()
+
+
+def _v4_exchange_boundary_kv(kv, d_window, cp_group):
+    from primus.backends.megatron.core.transformer.deepseek_v4_cp import exchange_boundary_kv
+
+    return exchange_boundary_kv(kv, d_window, cp_group)
+
+
 def _require_gfx950() -> None:
     """Assert the current device is gfx950 / CDNA4 before using the gluon backend.
 
@@ -542,9 +554,26 @@ class DeepseekV4Attention(MLASelfAttention):
         self.pg_collection = pg_collection
 
         # ---- shape fields (read by helpers in this class) ----
+        # ---- P14: head sharding across TP ----------------------------------
+        # Default (v4_shard_attention_heads off): every rank materialises all
+        # `num_heads` heads, because linear_q_up_proj gathers its output back to full
+        # width. TP then shards weights only, and the [B, S, H, head_dim] query is
+        # replicated -- 64 KiB/token at V4-Flash width, which is what caps the usable
+        # sequence length. With P14 on, each rank owns num_heads/tp heads end to end.
+        from primus.backends.megatron.core.models.deepseek_v4.deepseek_v4_layer_specs import (
+            v4_shard_heads as _v4_shard_heads,
+        )
+
+        self.shard_heads = _v4_shard_heads(config)
+        self.tp_size = (
+            int(getattr(config, "tensor_model_parallel_size", 1) or 1) if self.shard_heads else 1
+        )
+        num_heads_local = num_heads // self.tp_size
+
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_attention_heads_per_partition = num_heads
+        self.num_heads = num_heads_local
+        self.num_heads_global = num_heads
+        self.num_attention_heads_per_partition = num_heads_local
         self.num_query_groups_per_partition = 1  # single-latent KV
         self.head_dim = head_dim
         self.rotary_dim = rotary_dim
@@ -641,7 +670,8 @@ class DeepseekV4Attention(MLASelfAttention):
         # TE-fused sink primitive can land as a new spec field once it
         # actually replaces the inline path.
         if attn_sink_enabled:
-            self.attn_sink = nn.Parameter(torch.zeros(num_heads))
+            # One sink per head, so it shards with the heads under P14.
+            self.attn_sink = nn.Parameter(torch.zeros(num_heads_local))
         else:
             self.register_parameter("attn_sink", None)
 
@@ -923,6 +953,10 @@ class DeepseekV4Attention(MLASelfAttention):
             index_topk=index_topk,
             compress_ratio=self.compress_ratio,
             use_fp8_qk=bool(getattr(self.config, "use_v4_fp8_indexer", False)),
+            # P14: hand the indexer the TP group so it can shard its heads and
+            # all-reduce the partial score sums. None (the default) keeps the
+            # replicated, unsharded behaviour.
+            tp_group=self._v4_tp_group() if self.shard_heads else None,
         )
         if spec is None:
             return Indexer(**kwargs)
@@ -931,6 +965,21 @@ class DeepseekV4Attention(MLASelfAttention):
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _v4_tp_group():
+        """Tensor-parallel process group, or None when TP is off / dist is not up."""
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+        from megatron.core import parallel_state
+
+        try:
+            g = parallel_state.get_tensor_model_parallel_group()
+        except (AssertionError, RuntimeError):
+            return None
+        return g if g is not None and g.size() > 1 else None
 
     @property
     def rope(self) -> DualRoPE:
@@ -1177,8 +1226,11 @@ class DeepseekV4Attention(MLASelfAttention):
         ``.weight`` after ``build_module``.)
         """
         B, S, H, Dh = attn.shape
-        G = self.o_groups
-        attn_g = attn.reshape(B, S, G, (H * Dh) // G)  # [B, S, G, H*Dh/G]
+        # Under P14 this rank owns o_groups/tp groups and H is already the local head
+        # count, so H*Dh/G_local is the same n_per_group as the unsharded path -- the
+        # group WIDTH is a property of o_groups, not of TP.
+        G = self.o_groups // self.tp_size
+        attn_g = attn.reshape(B, S, G, (H * Dh) // G)  # [B, S, G_local, H*Dh/G_local]
 
         wo_a = self.linear_o_a
         weight = wo_a.weight if hasattr(wo_a, "weight") else None
@@ -1188,7 +1240,7 @@ class DeepseekV4Attention(MLASelfAttention):
             o = _projection_forward(wo_a, attn_g.reshape(B, S, -1))
             o = o.view(B, S, G * self.o_lora_rank)
         else:
-            wo_a_w = weight.view(G, self.o_lora_rank, (H * Dh) // G)
+            wo_a_w = weight.view(G, self.o_lora_rank, (H * Dh) // G)  # G is local
             if _v4_o_a_fp8_enabled(self.config):
                 o = _fp8_grouped_o_a(attn_g, wo_a_w)  # per-group MXFP8
             else:
@@ -1458,7 +1510,10 @@ class DeepseekV4Attention(MLASelfAttention):
     # public forward
     # ------------------------------------------------------------------
 
-    def _attention_backend_forward(self, q_bh, k, v, *, additive_mask, hca_local_seqlen, S, device, dtype):
+    def _attention_backend_forward(
+        self, q_bh, k, v, *, additive_mask, hca_local_seqlen, S, device, dtype,
+        cp_dwindow=0, cp_global_start=0,
+    ):
         """Dense (cr=0) / HCA (cr=128) dispatch on ``use_v4_attention_backend``."""
         be = self._attn_backend
         if be == "gluon":
@@ -1518,6 +1573,8 @@ class DeepseekV4Attention(MLASelfAttention):
                 q_bh,
                 k,
                 v,
+                cp_dwindow=cp_dwindow,
+                cp_global_start=cp_global_start,
                 sink=self.attn_sink,
                 swa_window=int(self.attn_sliding_window),
                 additive_mask=additive_mask,
@@ -1598,6 +1655,28 @@ class DeepseekV4Attention(MLASelfAttention):
         v_local_bh = v_h.transpose(1, 2)
 
         if self.compress_ratio == 0:
+            # ---- context parallel (dense / SWA branch) ----------------------
+            # This branch is index-driven, so CP needs only the d_window post-RoPE KV rows
+            # left of this shard plus the shard's global offset; the kernel is unchanged.
+            # cp_dwindow == cp_global_start == 0 reproduces the non-CP path exactly.
+            cp_group = _v4_get_cp_group()
+            cp_dwindow = 0
+            cp_global_start = 0
+            if cp_group is not None:
+                cp_dwindow = int(self.attn_sliding_window)
+                cp_global_start = cp_group.rank() * S
+                boundary_kv = _v4_exchange_boundary_kv(kv, cp_dwindow, cp_group)
+                # Concatenate on the SINGLE-LATENT kv ([B, S, 1, D]) and expand afterwards.
+                # Concatenating the head-expanded [B, H, S, D] view instead would materialise
+                # a real H-fold tensor for both K and V -- 8.6 GB each at 128k rows with
+                # H=64 -- where the expand is otherwise free. K and V are the same tensor in
+                # V4's single-latent design, so one buffer serves both.
+                kv_full = torch.cat([boundary_kv, kv], dim=1)  # [B, d_window + S, 1, D]
+                kv_full_bh = kv_full.expand(
+                    B, cp_dwindow + S, self.num_heads, self.head_dim
+                ).transpose(1, 2)
+                k_local_bh = kv_full_bh
+                v_local_bh = kv_full_bh
             out_bh = self._attention_backend_forward(
                 q_bh,
                 k_local_bh,
@@ -1607,8 +1686,16 @@ class DeepseekV4Attention(MLASelfAttention):
                 S=S,
                 device=device,
                 dtype=dtype,
+                cp_dwindow=cp_dwindow,
+                cp_global_start=cp_global_start,
             )
         elif self.compress_ratio == 128:
+            if _v4_get_cp_group() is not None:
+                raise NotImplementedError(
+                    "DeepSeek-V4 context parallel is implemented for the dense branch only "
+                    "(compress_ratio 0). This layer has compress_ratio=128 (HCA). Set "
+                    "compress_ratios to all zeros, or context_parallel_size to 1."
+                )
             # HCA: the local SWA branch and the compressed-pool branch share ONE
             # softmax with ONE sink column; concatenate the pool to the local
             # keys and pass the pool-only additive mask.
@@ -1626,14 +1713,24 @@ class DeepseekV4Attention(MLASelfAttention):
                 dtype=dtype,
             )
         elif self.compress_ratio == 4:
+            if _v4_get_cp_group() is not None:
+                raise NotImplementedError(
+                    "DeepSeek-V4 context parallel is implemented for the dense branch only "
+                    "(compress_ratio 0). This layer has compress_ratio=4 (CSA). Set "
+                    "compress_ratios to all zeros, or context_parallel_size to 1."
+                )
             # CSA cannot use ``core_attention``: the per-query top-K
             # gather (``gathered = pool[..., topk_idxs, :]``, shape
             # ``[B, H, S, K, head_dim]``) is sparse-per-row indexed
             # attention — there is no flash-attn kernel that reads a
             # different per-query subset of keys from a pool.  Stays on
             # eager-Python under plan-3 (a custom kernel is required).
-            local_mask = self._local_mask(S, device=device, dtype=dtype)
-            out_bh = self._csa_forward(hidden, q_bh, k_local_bh, v_local_bh, local_mask)
+            # `_csa_forward` documents `local_mask` as retained for back-compat and
+            # `del`s it on entry -- the reference op rebuilds the SWA mask from
+            # `swa_window` itself. Materialising it here costs a dense [S, S] byte
+            # tensor for nothing: 16 GiB at S=131072, which is what made CSA OOM at
+            # 128k. Pass None; the callee never reads it.
+            out_bh = self._csa_forward(hidden, q_bh, k_local_bh, v_local_bh, None)
         else:
             # Guarded by __init__; included for static-analysis completeness.
             raise ValueError(f"Unsupported compress_ratio {self.compress_ratio}")

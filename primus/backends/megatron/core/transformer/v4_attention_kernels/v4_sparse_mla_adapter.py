@@ -162,6 +162,8 @@ class _V4SparseMLAAttnFn(torch.autograd.Function):
         additive_mask: Optional[torch.Tensor],  # [S, P] pool-only mask (HCA) or None
         scale: float,
         hca_local_seqlen: int,
+        cp_dwindow: int,
+        cp_global_start: int,
         fwd_fn: Callable,
         bwd_fn: Callable,
     ) -> torch.Tensor:
@@ -173,10 +175,20 @@ class _V4SparseMLAAttnFn(torch.autograd.Function):
 
         device = q_bh.device
         base = (torch.arange(B, device=device) * Skv).view(B, 1, 1)
-        win_pos = (
-            torch.arange(S, device=device).view(S, 1) - W + 1 + torch.arange(W, device=device).view(1, W)
+        # Context parallel: this rank owns global rows [cp_global_start, +S), and its KV
+        # buffer is [boundary ++ local] with `cp_dwindow` boundary rows received from the
+        # left neighbour. So the window is validated against GLOBAL positions (a token must
+        # not attend before the sequence start) but indexed in LOCAL buffer coordinates.
+        # With cp_dwindow == cp_global_start == 0 this is byte-identical to the non-CP form.
+        gpos = (
+            torch.arange(S, device=device).view(S, 1)
+            + int(cp_global_start)
+            - W
+            + 1
+            + torch.arange(W, device=device).view(1, W)
         )
-        win_valid = win_pos >= 0
+        win_valid = gpos >= 0
+        win_pos = gpos - int(cp_global_start) + int(cp_dwindow)
         win_idx = base + win_pos.view(1, S, W)
         win_idx = torch.where(win_valid.view(1, S, W), win_idx, torch.full_like(win_idx, -1))
 
@@ -232,8 +244,9 @@ class _V4SparseMLAAttnFn(torch.autograd.Function):
         if not ctx.sink_was_none and dsink is not None:
             dsink_out = dsink.to(sink_saved.dtype)
 
-        # forward args: (q, k, v, sink, swa_window, additive_mask, scale, hca_local_seqlen, fwd_fn, bwd_fn)
-        return dq_bh, dk_bh, dv_bh, dsink_out, None, None, None, None, None, None
+        # forward args: (q, k, v, sink, swa_window, additive_mask, scale, hca_local_seqlen,
+        #                cp_dwindow, cp_global_start, fwd_fn, bwd_fn)
+        return dq_bh, dk_bh, dv_bh, dsink_out, None, None, None, None, None, None, None, None
 
 
 def make_csa_from_pool(fwd_fn: Callable, bwd_fn: Callable) -> Callable:
@@ -279,6 +292,8 @@ def make_attention(fwd_fn: Callable, bwd_fn: Callable) -> Callable:
         training,
         scale,
         hca_local_seqlen=0,
+        cp_dwindow=0,
+        cp_global_start=0,
     ):
         if attn_dropout > 0.0 and training:
             raise NotImplementedError(
@@ -286,7 +301,8 @@ def make_attention(fwd_fn: Callable, bwd_fn: Callable) -> Callable:
                 f"(V4 trains with attn_dropout=0). Got attn_dropout={attn_dropout}, training={training}."
             )
         return _V4SparseMLAAttnFn.apply(
-            q, k, v, sink, int(swa_window), additive_mask, float(scale), int(hca_local_seqlen), fwd_fn, bwd_fn
+            q, k, v, sink, int(swa_window), additive_mask, float(scale), int(hca_local_seqlen),
+            int(cp_dwindow), int(cp_global_start), fwd_fn, bwd_fn,
         )
 
     return _attention

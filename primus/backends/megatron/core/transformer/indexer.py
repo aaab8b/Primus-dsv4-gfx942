@@ -210,10 +210,27 @@ class Indexer(nn.Module):
         compress_ratio: int = 4,
         dq_rank: int = None,
         use_fp8_qk: bool = False,
+        tp_group=None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.index_head_dim = index_head_dim
+        # ---- P14: shard indexer heads across TP --------------------------------
+        # The score is a SUM over heads, so heads can be split across TP ranks and the
+        # partial sums all-reduced. Two things follow:
+        #   * each rank's local head count is index_n_heads / tp, which for V4-Flash at
+        #     tp=8 is 8 -- inside `_SUPPORTED_H` of the fused Triton scoring kernel, so
+        #     the fused path becomes usable without touching that kernel; and
+        #   * the [B, S, H, P] einsum intermediate shrinks by tp on every rank.
+        self.tp_group = tp_group
+        self.tp_size = tp_group.size() if tp_group is not None else 1
+        if self.tp_size > 1 and index_n_heads % self.tp_size != 0:
+            raise ValueError(
+                f"indexer head sharding requires index_n_heads ({index_n_heads}) divisible "
+                f"by tensor_model_parallel_size ({self.tp_size})."
+            )
+        self.index_n_heads_global = index_n_heads
+        index_n_heads = index_n_heads // self.tp_size
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
         self.compress_ratio = compress_ratio
@@ -336,7 +353,7 @@ class Indexer(nn.Module):
         # FP8 (paper / NVIDIA backend.linear) when enabled, else the bf16 nn.Linear.
         proj = _fp8_linear if _indexer_fp8_proj_enabled() else (lambda lin, x: lin(x))
         if self._fuse_qw_proj:
-            dqw = proj(self.w_dq_w, hidden)  # [B, S, dq_rank + H] in one GEMM
+            dqw = proj(self.w_dq_w, hidden)  # [B, S, dq_rank + local H] in one GEMM
             q_q = dqw[..., : self.dq_rank]  # [B, S, dq_rank]
             w_i = dqw[..., self.dq_rank :]  # [B, S, H]
         else:
@@ -396,6 +413,15 @@ class Indexer(nn.Module):
                 scores = (relu * w_i.unsqueeze(-1)).sum(dim=2)  # [B, S, P]
                 mask = self._causal_mask(S, P, scores.device, scores.dtype)  # [S, P]
                 scores = scores + mask.unsqueeze(0)  # [B, S, P]
+
+        # P14: with heads sharded, `scores` holds only this rank's partial head sum, so
+        # reduce before the top-k -- the selection must see the full-head score. The
+        # causal mask is 0 / -inf and survives the sum unchanged (-inf + finite = -inf),
+        # so it does not need to be re-applied or divided out.
+        if self.tp_size > 1:
+            import torch.distributed as _dist
+
+            _dist.all_reduce(scores, group=self.tp_group)
 
         topk_eff = min(K, P)
         topk_scores, topk_idxs = scores.topk(topk_eff, dim=-1)  # [B, S, topk_eff]
