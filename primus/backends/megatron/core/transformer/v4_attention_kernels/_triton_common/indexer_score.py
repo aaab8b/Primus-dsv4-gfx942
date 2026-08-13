@@ -96,6 +96,7 @@ def _indexer_score_fwd_kernel(
     P,
     H: tl.constexpr,
     HD: tl.constexpr,
+    Q_OFFSET,
     COMPRESS_RATIO: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_P: tl.constexpr,
@@ -180,7 +181,10 @@ def _indexer_score_fwd_kernel(
 
     # Apply causal mask inline.  Allowed iff `(p + 1) * cr - 1 <= s`,
     # i.e. the pool position's window end is no later than the query.
-    s_arr = s_offs[:, None]
+    # Under context parallel this rank holds a slice of the queries but the FULL pool,
+    # so visibility must be judged on the query's GLOBAL position. Q_OFFSET is 0 without
+    # CP, which reproduces the original expression exactly.
+    s_arr = s_offs[:, None] + Q_OFFSET
     p_arr = p_offs[None, :]
     allowed = (p_arr + 1) * COMPRESS_RATIO - 1 <= s_arr
     NEG_INF = -float("inf")
@@ -207,6 +211,7 @@ def _indexer_score_bwd_kernel(
     P,
     H: tl.constexpr,
     HD: tl.constexpr,
+    Q_OFFSET,
     COMPRESS_RATIO: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_P: tl.constexpr,
@@ -259,7 +264,10 @@ def _indexer_score_bwd_kernel(
         other=0.0,
     ).to(tl.float32)
     # Apply causal mask (zero out invalid positions).
-    s_arr = s_offs[:, None]
+    # Under context parallel this rank holds a slice of the queries but the FULL pool,
+    # so visibility must be judged on the query's GLOBAL position. Q_OFFSET is 0 without
+    # CP, which reproduces the original expression exactly.
+    s_arr = s_offs[:, None] + Q_OFFSET
     p_arr = p_offs[None, :]
     allowed = (p_arr + 1) * COMPRESS_RATIO - 1 <= s_arr
     d_acc = tl.where(allowed, dmasked, 0.0)
@@ -377,6 +385,7 @@ class IndexerScoreFn(torch.autograd.Function):
         w_i: torch.Tensor,
         compress_ratio: int,
         out_dtype: torch.dtype,
+        q_offset: int = 0,
     ):
         if q_i.dim() != 4:
             raise ValueError(f"q_i must be [B, S, H, Hd], got shape {tuple(q_i.shape)}")
@@ -420,6 +429,7 @@ class IndexerScoreFn(torch.autograd.Function):
             P,
             H=H,
             HD=HD,
+            Q_OFFSET=int(q_offset),
             COMPRESS_RATIO=int(compress_ratio),
             BLOCK_S=block_s,
             BLOCK_P=block_p,
@@ -433,6 +443,7 @@ class IndexerScoreFn(torch.autograd.Function):
 
         ctx.save_for_backward(q_c, k_c, w_c)
         ctx.compress_ratio = int(compress_ratio)
+        ctx.q_offset = int(q_offset)
         ctx.shape = (B, S, P, H, HD)
         ctx.in_dtypes = (q_i.dtype, k_icomp.dtype, w_i.dtype)
         return scores
@@ -442,6 +453,7 @@ class IndexerScoreFn(torch.autograd.Function):
         q_c, k_c, w_c = ctx.saved_tensors
         B, S, P, H, HD = ctx.shape
         compress_ratio = ctx.compress_ratio
+        q_offset = ctx.q_offset
         q_dtype, k_dtype, w_dtype = ctx.in_dtypes
 
         d_scores = d_scores.contiguous()
@@ -466,12 +478,13 @@ class IndexerScoreFn(torch.autograd.Function):
             P,
             H=H,
             HD=HD,
+            Q_OFFSET=int(q_offset),
             COMPRESS_RATIO=int(compress_ratio),
             BLOCK_S=block_s,
             BLOCK_P=block_p,
         )
 
-        return d_q_fp32.to(q_dtype), d_k_fp32.to(k_dtype), d_w_fp32.to(w_dtype), None, None
+        return d_q_fp32.to(q_dtype), d_k_fp32.to(k_dtype), d_w_fp32.to(w_dtype), None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -517,13 +530,14 @@ def indexer_score_triton(
     *,
     compress_ratio: int,
     out_dtype: torch.dtype,
+    q_offset: int = 0,
 ) -> torch.Tensor:
     """Compute Indexer scores via the fused Triton kernel.
 
     Returns ``scores [B, S, P]`` of dtype ``out_dtype``.  Masked
     positions hold ``-inf``.
     """
-    return IndexerScoreFn.apply(q_i, k_icomp, w_i, compress_ratio, out_dtype)
+    return IndexerScoreFn.apply(q_i, k_icomp, w_i, compress_ratio, out_dtype, q_offset)
 
 
 __all__ = [

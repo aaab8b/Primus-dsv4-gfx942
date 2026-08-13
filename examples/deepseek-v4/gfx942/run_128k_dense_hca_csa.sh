@@ -4,6 +4,13 @@
 # Model: 4 decoder layers with compress_ratios [0, 0, 4, 128] -- so the run exercises all
 # three V4 attention branches (dense+SWA, CSA, HCA), not just the cheap dense one.
 #
+# Parallelism is CP=8 / TP=1 / EP=8. That is NOT the obvious choice and it matters a lot:
+# the same recipe at TP=8 / CP=1 peaks at 188.63 GB and 9.4 s/step, this one at 42.30 GB
+# and 3.83 s/step. The reason is that the dominant tensors do not have a head axis, so TP
+# cannot shard them -- the indexer's `scores` is [B, S, P] (heads are already summed out),
+# V4's KV is a single MQA latent, and the MoE / residual activations scale with S alone.
+# CP shards the sequence and therefore shards all of them.
+#
 # Everything is resolved relative to this script, so the repo can live anywhere. Run it
 # from inside a rocm/primus:v26.5-pytorch2.12-te2.15 container:
 #
@@ -79,6 +86,18 @@ export PRIMUS_DSA_BWD_NUM_STAGES="${PRIMUS_DSA_BWD_NUM_STAGES:-1}"
 # materialises [B, S, H, P] -- 512 GiB at 128k.
 export PRIMUS_INDEXER_TRITON_FULL="${PRIMUS_INDEXER_TRITON_FULL:-1}"
 
+# ---- memory ---------------------------------------------------------------------------
+# Chunked linear + cross-entropy. The LM head's logits are [S, B, vocab]; at 128k with
+# vocab 129280 that is 31.6 GiB before the loss even upcasts, and it was measured as the
+# single largest allocation in the step -- larger than any attention tensor. Off by
+# default upstream; this recipe wants it.
+export FUSED_LINEAR_CE="${FUSED_LINEAR_CE:-1}"
+export FUSED_CE_CHUNK="${FUSED_CE_CHUNK:-4096}"
+# REQUIRED with FUSED_LINEAR_CE: the chunked backward issues one autograd.grad per chunk,
+# which changes each parameter's backward-hook firing count and desyncs the distributed
+# optimizer's overlapped parameter all-gather. DeepseekV4Model raises if you forget.
+export PRIMUS_OVERLAP_PARAM_GATHER="${PRIMUS_OVERLAP_PARAM_GATHER:-false}"
+
 # ---- model / parallelism ------------------------------------------------------------
 export PRIMUS_SEQ_LENGTH=131072
 export PRIMUS_MAX_POSITION_EMBEDDINGS=131072
@@ -88,20 +107,21 @@ export PRIMUS_COMPRESS_RATIOS="[0, 0, 4, 128, 0]"   # dense, dense, CSA, HCA (+M
 export PRIMUS_RECOMPUTE_LAYERS=4
 export PRIMUS_NUM_EXPERTS="${PRIMUS_NUM_EXPERTS:-8}"
 export PRIMUS_MOE_TOPK="${PRIMUS_MOE_TOPK:-1}"
-# P14 head sharding. TP=8 is REQUIRED, not a tuning choice: it is what shards the
-# attention activations and puts the indexer at 8 local heads. TP=1 OOMs (measured).
-export PRIMUS_SHARD_HEADS=true
-export PRIMUS_TP=8
+# CP=8 shards the sequence; EP=8 shards the experts over the same 8 ranks (the expert side
+# decomposes as ETP*EP*PP, which does not include CP, so both can be 8 on 8 GPUs).
+# P14 head sharding is off because TP=1 -- see the header for why TP is the wrong lever.
+export PRIMUS_SHARD_HEADS=false
+export PRIMUS_TP=1
 export PRIMUS_ETP=1
-export PRIMUS_EP=1
-export PRIMUS_CP=1
+export PRIMUS_EP=8
+export PRIMUS_CP=8
 export MBS=1
 export GBS=1
 # Random init at 128k diverges at the default 1e-5 (NaN on step 2); 1e-6 is stable.
 export PRIMUS_LR="${PRIMUS_LR:-1.0e-6}"
 export TRAIN_ITERS="${TRAIN_ITERS:-10}"
 export V4_TOKENIZER
-export PRIMUS_EXP_NAME="${PRIMUS_EXP_NAME:-dsv4_4layer_128k_dense_hca_csa}"
+export PRIMUS_EXP_NAME="${PRIMUS_EXP_NAME:-dsv4_4layer_128k_cp8}"
 
 EXP="${EXP:-examples/megatron/configs/MI355X/deepseek_v4_flash_4layer-BF16-sft.yaml}"
 LOGDIR="${PRIMUS_OUTPUT_ROOT}/${PRIMUS_TEAM}/${PRIMUS_USER}/${PRIMUS_EXP_NAME}"
@@ -109,7 +129,8 @@ mkdir -p "${LOGDIR}"
 
 echo "[run] repo=${REPO}"
 echo "[run] seq=${PRIMUS_SEQ_LENGTH} layers=${PRIMUS_TOTAL_LAYERS} ratios=${PRIMUS_COMPRESS_RATIOS}"
-echo "[run] TP=${PRIMUS_TP} (P14 head sharding on)  iters=${TRAIN_ITERS}"
+echo "[run] CP=${PRIMUS_CP} TP=${PRIMUS_TP} EP=${PRIMUS_EP}  iters=${TRAIN_ITERS}"
+echo "[run] expect ~42 GB peak, ~3.8 s/step"
 echo "[run] log=${LOGDIR}/log_node0.txt"
 
 ./primus-cli direct -- train pretrain --config "${EXP}" \

@@ -101,4 +101,5 @@ echo "[run] EXP=$EXP SEQ=$PRIMUS_SEQ_LENGTH TP=$PRIMUS_TP EP=$PRIMUS_EP GBS=$GBS
   --pp_warmup False --sequence_parallel False \
   --log_avg_skip_iterations 3 \
   --backend_path "$BACKEND_PATH" \
+  ${EXTRA_ARGS:-} \
   2>&1 | tee "$LOGDIR/log_node0.txt"

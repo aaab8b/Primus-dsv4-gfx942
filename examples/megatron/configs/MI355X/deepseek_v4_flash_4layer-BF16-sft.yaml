@@ -150,8 +150,8 @@ modules:
       rope_type: rope
 
       # ---------- recompute (mandatory at long context) ----------
-      recompute_granularity: full
-      recompute_method: block
+      recompute_granularity: ${PRIMUS_RECOMPUTE_GRANULARITY:full}
+      recompute_method: ${PRIMUS_RECOMPUTE_METHOD:block}
       recompute_num_layers: ${PRIMUS_RECOMPUTE_LAYERS:4}
 
       # ---------- ckpt: random init, save nothing ----------

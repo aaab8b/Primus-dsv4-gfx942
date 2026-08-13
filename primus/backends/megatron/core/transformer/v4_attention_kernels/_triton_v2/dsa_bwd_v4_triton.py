@@ -72,6 +72,17 @@ def sparse_mla_bwd_v4_triton(q, kv, o, do, topk_indices, lse, attn_sink=None, kv
         R_CHUNK = min(topk, 1536)
     else:
         R_CHUNK = min(256, topk)
+    # The defaults above are tuned for SHORT sequences, where the per-chunk buffers are
+    # small and the dq read-modify-write traffic dominates. At long context that trade
+    # inverts hard: the buffers below scale with total_tokens * R_CHUNK, so at
+    # S_local = 131072 (1M context, CP=8) R_CHUNK=256 makes `interm` alone
+    # 131072 * 256 * 576 * 2 B = 36 GiB, plus 8 GiB for chunk_dS/chunk_P -- a 44 GiB
+    # workspace spent to avoid some dq reloads. PRIMUS_DSA_BWD_R_CHUNK trades that back.
+    # Chunking is a partition of the same computation, so any value is numerically
+    # equivalent; note that R_CHUNK % 128 != 0 also disables the fused dKV path below.
+    _r_override = os.environ.get("PRIMUS_DSA_BWD_R_CHUNK", "")
+    if _r_override:
+        R_CHUNK = max(1, min(int(_r_override), topk))
     # BH_DQ x D_V is the dominant LDS term of _bwd_chunk_dq_store_ds. With the V4
     # latent head_dim of 512, BH_DQ=64 needs 64*512*2 = 65536 B for the Q tile
     # alone -- exactly the whole 64 KB LDS budget of gfx942/CDNA3 -- and the kernel
