@@ -136,6 +136,7 @@ modules:
       # fp32 grads + fp32 exp_avg_sq fix it.
       use_precision_aware_optimizer: true
       main_grads_dtype: ${PRIMUS_MAIN_GRADS_DTYPE:fp32}
+      main_params_dtype: ${PRIMUS_MAIN_PARAMS_DTYPE:fp32}
       exp_avg_dtype: ${PRIMUS_EXP_AVG_DTYPE:bf16}
       exp_avg_sq_dtype: ${PRIMUS_EXP_AVG_SQ_DTYPE:fp32}
       use_distributed_optimizer: true
